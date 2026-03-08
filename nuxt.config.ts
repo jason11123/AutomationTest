@@ -1,4 +1,4 @@
-﻿export default defineNuxtConfig({
+export default defineNuxtConfig({
   devtools: { enabled: true },
   css: ['~/assets/css/main.css'],
   nitro: {
@@ -11,7 +11,9 @@
     openaiTemperature: process.env.OPENAI_TEMPERATURE || '0.7',
     openaiMaxOutputTokens: process.env.OPENAI_MAX_OUTPUT_TOKENS || '512',
     openaiSystemPrompt: process.env.OPENAI_SYSTEM_PROMPT || 'You are a helpful assistant.',
-    appTimezone: process.env.APP_TIMEZONE || 'Asia/Jakarta'
+    appTimezone: process.env.APP_TIMEZONE || 'Asia/Jakarta',
+    dbUrl: process.env.DB_URL || '',
+    dbSslMode: process.env.DB_SSL_MODE || 'require'
   },
   app: {
     head: {

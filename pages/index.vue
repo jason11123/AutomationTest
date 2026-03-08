@@ -1,8 +1,16 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
+import { clearAuthSession, readAuthSession, type ClientAuthUser } from '~/utils/auth-session'
+
+definePageMeta({
+  middleware: 'auth'
+})
+
 type WorkflowResult = {
   topic: string
   step: string[]
   meta?: {
+    id?: string
+    model?: string
     usage?: TokenUsage
   }
 }
@@ -19,11 +27,22 @@ type TokenUsage = {
 type StepItem = {
   index: number
   step: string
+  workflowStepId: string | null
   status: StepStatus
   output: string
   error: string
   expanded: boolean
   usage: TokenUsage | null
+}
+
+type PersistedWorkflowResponse = {
+  workflow: {
+    id: string
+  }
+  steps: Array<{
+    id: string
+    step_order: number
+  }>
 }
 
 const prompt = ref('')
@@ -34,6 +53,12 @@ const workflow = ref<WorkflowResult | null>(null)
 const stepItems = ref<StepItem[]>([])
 const workflowUsage = ref<TokenUsage | null>(null)
 const runningAll = ref(false)
+const currentUser = ref<ClientAuthUser | null>(null)
+const persistedWorkflowId = ref<string | null>(null)
+
+if (process.client) {
+  currentUser.value = readAuthSession()?.user || null
+}
 
 async function submitPrompt() {
   if (!prompt.value.trim()) {
@@ -47,6 +72,7 @@ async function submitPrompt() {
   workflow.value = null
   stepItems.value = []
   workflowUsage.value = null
+  persistedWorkflowId.value = null
 
   try {
     const workflowResponse = await $fetch<WorkflowResult>('/api/workflowbuilder', {
@@ -59,6 +85,7 @@ async function submitPrompt() {
     stepItems.value = workflowResponse.step.map((step, idx) => ({
       index: idx + 1,
       step,
+      workflowStepId: null,
       status: 'pending_approval',
       output: '',
       error: '',
@@ -66,13 +93,57 @@ async function submitPrompt() {
       usage: null
     }))
 
-    stageMessage.value = 'Workflow siap. Approve dan jalankan tiap step.'
+    await saveWorkflowToDatabase(workflowResponse)
+    stageMessage.value = 'Workflow siap, sudah tersimpan ke database. Approve dan jalankan tiap step.'
   } catch (error: any) {
     stageMessage.value = ''
     errorMessage.value =
       error?.data?.statusMessage || error?.message || 'Terjadi kesalahan saat memanggil API.'
   } finally {
     loading.value = false
+  }
+}
+
+async function saveWorkflowToDatabase(workflowResponse: WorkflowResult) {
+  if (!currentUser.value?.id) {
+    return
+  }
+
+  try {
+    const saved = await $fetch<PersistedWorkflowResponse>('/api/workflows', {
+      method: 'POST',
+      headers: {
+        'x-user-id': currentUser.value.id
+      },
+      body: {
+        userId: currentUser.value.id,
+        title: workflowResponse.topic,
+        topic: workflowResponse.topic,
+        sourcePrompt: prompt.value,
+        status: 'active',
+        steps: workflowResponse.step.map((instruction, idx) => ({
+          step_order: idx + 1,
+          instruction,
+          is_enabled: true
+        })),
+        builderUsage: workflowResponse.meta?.usage || null,
+        llmMeta: {
+          model: workflowResponse.meta?.model || '',
+          providerResponseId: workflowResponse.meta?.id || ''
+        }
+      }
+    })
+
+    persistedWorkflowId.value = saved.workflow.id
+    const stepIdMap = new Map<number, string>()
+    for (const step of saved.steps || []) {
+      stepIdMap.set(Number(step.step_order), step.id)
+    }
+    for (const item of stepItems.value) {
+      item.workflowStepId = stepIdMap.get(item.index) || null
+    }
+  } catch {
+    stageMessage.value = 'Workflow berhasil dibuat tapi belum tersimpan ke database.'
   }
 }
 
@@ -147,6 +218,9 @@ async function runStep(stepIndex: number) {
       {
         method: 'POST',
         body: {
+          userId: currentUser.value?.id,
+          workflowId: persistedWorkflowId.value,
+          workflowStepId: item.workflowStepId,
           topic: workflow.value.topic,
           step: item.step,
           index: item.index,
@@ -214,11 +288,30 @@ function statusLabel(status: StepStatus) {
   if (status === 'success') return 'Success'
   return 'Error'
 }
+
+async function logout() {
+  clearAuthSession()
+  await $fetch('/api/auth/logout', { method: 'POST' })
+  currentUser.value = null
+  await navigateTo('/login')
+}
 </script>
 
 <template>
   <main class="container">
     <section class="card">
+      <div class="navbar">
+        <nav class="nav-menu">
+          <NuxtLink to="/">Workflow Runner</NuxtLink>
+          <NuxtLink to="/">My Workflows</NuxtLink>
+          <NuxtLink to="/">Analytics</NuxtLink>
+        </nav>
+        <div class="nav-user">
+          <span>{{ currentUser?.full_name || currentUser?.email }}</span>
+          <button class="button small ghost" type="button" @click="logout">Logout</button>
+        </div>
+      </div>
+
       <h1>Agate AI Agent Workflow</h1>
       <p>Autonomous Task Runner</p>
 
@@ -325,6 +418,27 @@ function statusLabel(status: StepStatus) {
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   padding: 1.25rem;
+}
+
+.navbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.nav-menu {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+}
+
+.nav-user {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
 }
 
 h1 {
