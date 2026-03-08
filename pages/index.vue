@@ -4,10 +4,15 @@ type WorkflowResult = {
   step: string[]
 }
 
-type ExecutionLog = {
+type StepStatus = 'pending_approval' | 'approved' | 'running' | 'success' | 'error'
+
+type StepItem = {
   index: number
   step: string
+  status: StepStatus
   output: string
+  error: string
+  expanded: boolean
 }
 
 const prompt = ref('')
@@ -15,7 +20,7 @@ const loading = ref(false)
 const stageMessage = ref('')
 const errorMessage = ref('')
 const workflow = ref<WorkflowResult | null>(null)
-const executionLogs = ref<ExecutionLog[]>([])
+const stepItems = ref<StepItem[]>([])
 
 async function submitPrompt() {
   if (!prompt.value.trim()) {
@@ -27,7 +32,7 @@ async function submitPrompt() {
   stageMessage.value = 'Menyusun workflow...'
   errorMessage.value = ''
   workflow.value = null
-  executionLogs.value = []
+  stepItems.value = []
 
   try {
     const workflowResponse = await $fetch<WorkflowResult>('/api/workflowbuilder', {
@@ -36,8 +41,16 @@ async function submitPrompt() {
     })
 
     workflow.value = workflowResponse
+    stepItems.value = workflowResponse.step.map((step, idx) => ({
+      index: idx + 1,
+      step,
+      status: 'pending_approval',
+      output: '',
+      error: '',
+      expanded: false
+    }))
 
-    await streamExecution(workflowResponse.topic, workflowResponse.step)
+    stageMessage.value = 'Workflow siap. Approve dan jalankan tiap step.'
   } catch (error: any) {
     stageMessage.value = ''
     errorMessage.value =
@@ -47,62 +60,111 @@ async function submitPrompt() {
   }
 }
 
-function streamExecution(topic: string, steps: string[]) {
-  return new Promise<void>((resolve, reject) => {
-    const params = new URLSearchParams({
-      topic,
-      steps: JSON.stringify(steps)
-    })
+function onStepEdited(stepIndex: number) {
+  const edited = stepItems.value.find((step) => step.index === stepIndex)
+  if (!edited) {
+    return
+  }
 
-    const source = new EventSource(`/api/workflowexecute-stream?${params.toString()}`)
-    let finished = false
-
-    source.addEventListener('stage', (event) => {
-      const data = safeJsonParse((event as MessageEvent).data)
-      if (data?.message) {
-        stageMessage.value = data.message
-      }
-    })
-
-    source.addEventListener('step', (event) => {
-      const data = safeJsonParse((event as MessageEvent).data)
-      if (data?.index && data?.step && data?.output) {
-        executionLogs.value.push(data as ExecutionLog)
-      }
-    })
-
-    source.addEventListener('execution_error', (event) => {
-      const data = safeJsonParse((event as MessageEvent).data)
-      finished = true
-      source.close()
-      reject(new Error(data?.message || 'Eksekusi workflow gagal.'))
-    })
-
-    source.addEventListener('done', (event) => {
-      const data = safeJsonParse((event as MessageEvent).data)
-      stageMessage.value = data?.message || 'Selesai.'
-      finished = true
-      source.close()
-      resolve()
-    })
-
-    source.onerror = () => {
-      if (finished) {
-        return
-      }
-
-      source.close()
-      reject(new Error('Koneksi stream terputus saat eksekusi workflow.'))
+  for (const item of stepItems.value) {
+    if (item.index < stepIndex) {
+      continue
     }
-  })
+
+    item.status = 'pending_approval'
+    item.output = ''
+    item.error = ''
+    item.expanded = item.index === stepIndex
+  }
+
+  stageMessage.value = `Perubahan di step ${stepIndex} terdeteksi. Approve ulang dari step ini.`
 }
 
-function safeJsonParse(value: string): any {
-  try {
-    return JSON.parse(value)
-  } catch {
-    return null
+function canRun(stepIndex: number) {
+  const current = stepItems.value.find((step) => step.index === stepIndex)
+  if (!current) {
+    return false
   }
+
+  const previousStepsDone = stepItems.value
+    .filter((step) => step.index < stepIndex)
+    .every((step) => step.status === 'success')
+
+  const allowedStatus = ['pending_approval', 'approved', 'error', 'success'] as StepStatus[]
+  return previousStepsDone && allowedStatus.includes(current.status)
+}
+
+async function runStep(stepIndex: number) {
+  if (!workflow.value) {
+    return
+  }
+
+  const item = stepItems.value.find((step) => step.index === stepIndex)
+  if (!item) {
+    return
+  }
+
+  if (!item.step.trim()) {
+    item.status = 'error'
+    item.error = 'Step tidak boleh kosong.'
+    item.expanded = true
+    return
+  }
+
+  if (!canRun(stepIndex)) {
+    item.status = item.status === 'pending_approval' ? 'pending_approval' : item.status
+    item.error = 'Pastikan step sebelumnya sukses.'
+    item.expanded = true
+    return
+  }
+
+  item.status = 'running'
+  item.error = ''
+
+  try {
+    const previousOutputs = stepItems.value
+      .filter((step) => step.index < stepIndex && step.status === 'success' && step.output.trim())
+      .map((step) => `Step ${step.index}: ${step.output}`)
+
+    const res = await $fetch<{ index: number; step: string; output: string }>('/api/workflowexecute-step', {
+      method: 'POST',
+      body: {
+        topic: workflow.value.topic,
+        step: item.step,
+        index: item.index,
+        previousOutputs
+      }
+    })
+
+    item.status = 'success'
+    item.output = res.output
+    item.error = ''
+    item.expanded = true
+
+    stageMessage.value = `Step ${item.index} selesai. Lanjut approve step berikutnya.`
+  } catch (error: any) {
+    item.status = 'error'
+    item.output = ''
+    item.error = error?.data?.statusMessage || error?.message || 'Eksekusi step gagal.'
+    item.expanded = true
+  }
+}
+
+function toggleStep(stepIndex: number) {
+  const item = stepItems.value.find((step) => step.index === stepIndex)
+  if (!item) {
+    return
+  }
+
+  item.expanded = !item.expanded
+}
+
+function statusLabel(status: StepStatus) {
+  if (status === 'pending_approval') return 'Ready'
+  if (status === 'approved') return 'Approved'
+  if (status === 'running') return 'Running'
+  if (status === 'success') return 'Success'
+  return 'Error'
 }
 </script>
 
@@ -130,20 +192,52 @@ function safeJsonParse(value: string): any {
       <section v-if="workflow" class="response">
         <h2>Workflow</h2>
         <p><strong>Topic:</strong> {{ workflow.topic }}</p>
-        <ol class="steps">
-          <li v-for="(item, idx) in workflow.step" :key="`${idx}-${item}`">{{ item }}</li>
-        </ol>
       </section>
 
-      <section v-if="executionLogs.length > 0" class="response">
-        <h2>Execution Log</h2>
-        <details v-for="log in executionLogs" :key="log.index" class="log-card">
-          <summary>Proses Step {{ log.index }}: {{ log.step }}</summary>
-          <div class="log-content">
-            <p><strong>Output:</strong></p>
-            <pre>{{ log.output }}</pre>
+      <section v-if="stepItems.length > 0" class="response">
+        <h2>Execution Steps</h2>
+
+        <article v-for="item in stepItems" :key="item.index" class="log-card">
+          <header class="log-header">
+            <div class="log-header-left">
+              <strong>Step {{ item.index }}</strong>
+              <span class="badge" :class="`status-${item.status}`">{{ statusLabel(item.status) }}</span>
+            </div>
+            <div class="log-header-actions">
+              <button
+                class="button small"
+                type="button"
+                :disabled="item.status === 'running' || !canRun(item.index)"
+                @click="runStep(item.index)"
+              >
+                {{ item.status === 'error' ? 'Retry' : item.status === 'success' ? 'Rerun' : 'Run' }}
+              </button>
+              <button class="button ghost small" type="button" @click="toggleStep(item.index)">
+                {{ item.expanded ? 'Hide' : 'Show' }}
+              </button>
+            </div>
+          </header>
+
+          <textarea
+            v-model="item.step"
+            class="step-editor"
+            rows="2"
+            :disabled="item.status === 'running'"
+            @input="onStepEdited(item.index)"
+          />
+
+          <div v-if="item.expanded" class="log-content">
+            <p v-if="item.error" class="error"><strong>Error:</strong> {{ item.error }}</p>
+            <p><strong>Output :</strong></p>
+            <textarea
+              v-model="item.output"
+              class="output-editor"
+              rows="5"
+              :disabled="item.status === 'running'"
+              placeholder="Output step akan muncul di sini. Kamu bisa edit manual."
+            />
           </div>
-        </details>
+        </article>
       </section>
     </section>
   </main>
@@ -159,7 +253,7 @@ function safeJsonParse(value: string): any {
 
 .card {
   width: 100%;
-  max-width: 860px;
+  max-width: 920px;
   background: #ffffff;
   border: 1px solid #e5e7eb;
   border-radius: 12px;
@@ -202,6 +296,16 @@ p {
   cursor: pointer;
 }
 
+.button.ghost {
+  background: #e5e7eb;
+  color: #111827;
+}
+
+.button.small {
+  padding: 0.35rem 0.7rem;
+  font-size: 0.82rem;
+}
+
 .button:disabled {
   opacity: 0.65;
   cursor: not-allowed;
@@ -223,28 +327,88 @@ p {
   padding-top: 1rem;
 }
 
-.steps {
-  margin: 0.5rem 0 0;
-  padding-left: 1.25rem;
-  color: #111827;
-}
-
 .log-card {
   margin-top: 0.9rem;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
-  padding: 0.65rem 0.75rem;
+  padding: 0.75rem;
   background: #f9fafb;
 }
 
-summary {
-  cursor: pointer;
-  font-weight: 600;
-  color: #111827;
+.log-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.log-header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.log-header-actions {
+  display: flex;
+  gap: 0.45rem;
+}
+
+.badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.status-pending_approval {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.status-approved {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.status-running {
+  background: #e0e7ff;
+  color: #4338ca;
+}
+
+.status-success {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.status-error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.step-editor {
+  width: 100%;
+  margin-top: 0.7rem;
+  resize: vertical;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 0.55rem;
+  font: inherit;
 }
 
 .log-content {
-  margin-top: 0.6rem;
+  margin-top: 0.65rem;
+}
+
+.output-editor {
+  width: 100%;
+  margin-top: 0.35rem;
+  resize: vertical;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 0.55rem;
+  font: inherit;
 }
 
 h2 {

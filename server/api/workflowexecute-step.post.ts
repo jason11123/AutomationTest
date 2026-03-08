@@ -8,114 +8,31 @@
     })
   }
 
-  const query = getQuery(event)
-  const topic = String(query.topic || '').trim()
-  const rawSteps = String(query.steps || '').trim()
-
-  let steps: string[] = []
-
-  try {
-    const parsed = JSON.parse(rawSteps)
-    steps = Array.isArray(parsed)
-      ? parsed.map((item: unknown) => String(item || '').trim()).filter(Boolean)
-      : []
-  } catch {
-    throw createError({
-      statusCode: 400,
-      statusMessage: 'Query "steps" harus berupa JSON array string.'
-    })
-  }
+  const body = await readBody<{ topic?: string; step?: string; index?: number; previousOutputs?: string[] }>(
+    event
+  )
+  const topic = String(body?.topic || '').trim()
+  const step = String(body?.step || '').trim()
+  const index = Number(body?.index)
+  const previousOutputs = Array.isArray(body?.previousOutputs)
+    ? body.previousOutputs.map((item) => String(item || '').trim()).filter(Boolean)
+    : []
 
   if (!topic) {
-    throw createError({
-      statusCode: 400,
-      statusMessage: 'Query "topic" wajib diisi.'
-    })
+    throw createError({ statusCode: 400, statusMessage: 'Field "topic" wajib diisi.' })
   }
 
-  if (steps.length === 0) {
-    throw createError({
-      statusCode: 400,
-      statusMessage: 'Query "steps" tidak boleh kosong.'
-    })
+  if (!step) {
+    throw createError({ statusCode: 400, statusMessage: 'Field "step" wajib diisi.' })
   }
 
-  const res = event.node.res
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-  res.setHeader('Cache-Control', 'no-cache, no-transform')
-  res.setHeader('Connection', 'keep-alive')
+  const safeIndex = Number.isFinite(index) && index > 0 ? index : 1
+  const output = await executeStep(config, topic, step, safeIndex, previousOutputs)
 
-  let closed = false
-  event.node.req.on('close', () => {
-    closed = true
-  })
-
-  const sendEvent = (name: string, payload: unknown) => {
-    if (closed || res.writableEnded) {
-      return
-    }
-
-    res.write(`event: ${name}\n`)
-    res.write(`data: ${JSON.stringify(payload)}\n\n`)
-  }
-
-  sendEvent('stage', { message: 'Menjalankan workflow step-by-step...' })
-
-  const logs: Array<{ index: number; step: string; output: string }> = []
-  const failed: Array<{ index: number; step: string; error: string }> = []
-
-  try {
-    for (let i = 0; i < steps.length; i += 1) {
-      if (closed || res.writableEnded) {
-        break
-      }
-
-      const stepText = steps[i]
-      sendEvent('stage', { message: `Menjalankan step ${i + 1}/${steps.length}...` })
-
-      try {
-        const output = await executeStep(config, topic, stepText, i + 1, steps.length)
-        const log = {
-          index: i + 1,
-          step: stepText,
-          output
-        }
-
-        logs.push(log)
-        sendEvent('step', log)
-      } catch (error: any) {
-        const errorMessage =
-          error?.statusMessage || error?.message || `Eksekusi step ke-${i + 1} gagal.`
-
-        failed.push({
-          index: i + 1,
-          step: stepText,
-          error: errorMessage
-        })
-
-        sendEvent('step_error', {
-          index: i + 1,
-          step: stepText,
-          error: errorMessage
-        })
-      }
-    }
-
-    sendEvent('done', {
-      message: 'Selesai.',
-      topic,
-      totalSteps: steps.length,
-      successSteps: logs.length,
-      failedSteps: failed.length
-    })
-  } catch (error: any) {
-    sendEvent('execution_error', {
-      message: error?.statusMessage || error?.message || 'Terjadi error saat eksekusi workflow.'
-    })
-  } finally {
-    if (!res.writableEnded) {
-      res.end()
-    }
+  return {
+    index: safeIndex,
+    step,
+    output
   }
 })
 
@@ -124,21 +41,34 @@ async function executeStep(
   topic: string,
   stepText: string,
   stepIndex: number,
-  totalSteps: number
+  previousOutputs: string[]
 ): Promise<string> {
   const timezone = String(config.appTimezone || 'Asia/Jakarta')
   const timeContext = buildTimeContext(timezone)
-  const sourcePolicy = [
-    'Source policy:',
-    '- For step-by-step stream execution, use only information from the current workflow context.',
-    '- Do not invent unsupported external facts.',
-    '- If data is missing, state the limitation clearly.'
-  ].join('\n')
+  const hasPreviousOutputs = previousOutputs.length > 0
+  const previousContext =
+    hasPreviousOutputs
+      ? `Previous step outputs:\n${previousOutputs.map((item, i) => `${i + 1}. ${item}`).join('\n')}`
+      : 'Previous step outputs: (none)'
+  const sourcePolicy = hasPreviousOutputs
+    ? [
+        'Source policy:',
+        '- Use ONLY information from Previous step outputs.',
+        '- Do not add external facts, assumptions, or new data.',
+        '- If required info is missing in previous outputs, state exactly what is missing.'
+      ].join('\n')
+    : [
+        'Source policy:',
+        '- No previous outputs are available.',
+        '- You may use reasoning and general/public knowledge to complete this step.',
+        '- Clearly separate facts vs assumptions when needed.'
+      ].join('\n')
 
   const executionInput = [
     timeContext,
     `Topic: ${topic}`,
-    `Current Step (${stepIndex}/${totalSteps}): ${stepText}`,
+    `Current Step (${stepIndex}): ${stepText}`,
+    previousContext,
     sourcePolicy,
     'Instruction: Execute only the current step and produce concrete output.'
   ].join('\n\n')
