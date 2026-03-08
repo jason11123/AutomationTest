@@ -55,10 +55,32 @@ const workflowUsage = ref<TokenUsage | null>(null)
 const runningAll = ref(false)
 const currentUser = ref<ClientAuthUser | null>(null)
 const persistedWorkflowId = ref<string | null>(null)
+const savingChanges = ref(false)
+const hasUnsavedChanges = ref(false)
+const route = useRoute()
 
 if (process.client) {
   currentUser.value = readAuthSession()?.user || null
 }
+
+onMounted(async () => {
+  const workflowId = String(route.query.workflowId || '').trim()
+  if (workflowId) {
+    await loadWorkflowFromHistory(workflowId)
+  }
+})
+
+watch(
+  () => route.query.workflowId,
+  async (value, oldValue) => {
+    const workflowId = String(value || '').trim()
+    const previous = String(oldValue || '').trim()
+    if (!workflowId || workflowId === previous) {
+      return
+    }
+    await loadWorkflowFromHistory(workflowId)
+  }
+)
 
 async function submitPrompt() {
   if (!prompt.value.trim()) {
@@ -73,6 +95,7 @@ async function submitPrompt() {
   stepItems.value = []
   workflowUsage.value = null
   persistedWorkflowId.value = null
+  hasUnsavedChanges.value = false
 
   try {
     const workflowResponse = await $fetch<WorkflowResult>('/api/workflowbuilder', {
@@ -99,6 +122,61 @@ async function submitPrompt() {
     stageMessage.value = ''
     errorMessage.value =
       error?.data?.statusMessage || error?.message || 'Terjadi kesalahan saat memanggil API.'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadWorkflowFromHistory(workflowId: string) {
+  if (!currentUser.value?.id) {
+    return
+  }
+
+  loading.value = true
+  stageMessage.value = 'Memuat workflow dari history...'
+  errorMessage.value = ''
+
+  try {
+    const res = await $fetch<{
+      workflow: {
+        id: string
+        topic: string
+        source_prompt: string | null
+      }
+      steps: Array<{
+        id: string
+        step_order: number
+        instruction: string
+      }>
+    }>(`/api/workflows/${workflowId}`, {
+      query: { userId: currentUser.value.id },
+      headers: { 'x-user-id': currentUser.value.id }
+    })
+
+    persistedWorkflowId.value = res.workflow.id
+    workflow.value = {
+      topic: res.workflow.topic,
+      step: [...res.steps].sort((a, b) => a.step_order - b.step_order).map((item) => item.instruction)
+    }
+    prompt.value = res.workflow.source_prompt || ''
+    workflowUsage.value = null
+    stepItems.value = [...res.steps]
+      .sort((a, b) => a.step_order - b.step_order)
+      .map((item) => ({
+        index: item.step_order,
+        step: item.instruction,
+        workflowStepId: item.id,
+        status: 'pending_approval',
+        output: '',
+        error: '',
+        expanded: false,
+        usage: null
+      }))
+    hasUnsavedChanges.value = false
+    stageMessage.value = 'Workflow history berhasil dimuat. Kamu bisa edit dan execute ulang.'
+  } catch (error: any) {
+    stageMessage.value = ''
+    errorMessage.value = error?.data?.statusMessage || error?.message || 'Gagal memuat workflow history.'
   } finally {
     loading.value = false
   }
@@ -147,6 +225,13 @@ async function saveWorkflowToDatabase(workflowResponse: WorkflowResult) {
   }
 }
 
+function onPromptEdited() {
+  if (!persistedWorkflowId.value) {
+    return
+  }
+  hasUnsavedChanges.value = true
+}
+
 function onStepEdited(stepIndex: number) {
   const edited = stepItems.value.find((step) => step.index === stepIndex)
   if (!edited) {
@@ -165,6 +250,7 @@ function onStepEdited(stepIndex: number) {
   }
 
   stageMessage.value = `Perubahan di step ${stepIndex} terdeteksi. Approve ulang dari step ini.`
+  hasUnsavedChanges.value = true
 }
 
 function canRun(stepIndex: number) {
@@ -272,6 +358,46 @@ async function runAllSteps() {
   }
 }
 
+async function saveWorkflowChanges() {
+  if (!persistedWorkflowId.value || !workflow.value || !currentUser.value?.id) {
+    return
+  }
+
+  savingChanges.value = true
+  errorMessage.value = ''
+
+  try {
+    const orderedSteps = [...stepItems.value]
+      .sort((a, b) => a.index - b.index)
+      .map((item, idx) => ({
+        step_order: idx + 1,
+        instruction: item.step,
+        is_enabled: true
+      }))
+
+    await $fetch(`/api/workflows/${persistedWorkflowId.value}`, {
+      method: 'PUT',
+      query: { userId: currentUser.value.id },
+      headers: { 'x-user-id': currentUser.value.id },
+      body: {
+        userId: currentUser.value.id,
+        title: workflow.value.topic,
+        topic: workflow.value.topic,
+        sourcePrompt: prompt.value,
+        steps: orderedSteps
+      }
+    })
+
+    hasUnsavedChanges.value = false
+    stageMessage.value = 'Perubahan workflow berhasil disimpan.'
+    await loadWorkflowFromHistory(persistedWorkflowId.value)
+  } catch (error: any) {
+    errorMessage.value = error?.data?.statusMessage || error?.message || 'Gagal menyimpan perubahan workflow.'
+  } finally {
+    savingChanges.value = false
+  }
+}
+
 function toggleStep(stepIndex: number) {
   const item = stepItems.value.find((step) => step.index === stepIndex)
   if (!item) {
@@ -300,17 +426,7 @@ async function logout() {
 <template>
   <main class="container">
     <section class="card">
-      <div class="navbar">
-        <nav class="nav-menu">
-          <NuxtLink to="/">Workflow Runner</NuxtLink>
-          <NuxtLink to="/">My Workflows</NuxtLink>
-          <NuxtLink to="/">Analytics</NuxtLink>
-        </nav>
-        <div class="nav-user">
-          <span>{{ currentUser?.full_name || currentUser?.email }}</span>
-          <button class="button small ghost" type="button" @click="logout">Logout</button>
-        </div>
-      </div>
+      <AppNavbar :current-user="currentUser" @logout="logout" />
 
       <h1>Agate AI Agent Workflow</h1>
       <p>Autonomous Task Runner</p>
@@ -321,6 +437,7 @@ async function logout() {
           class="textarea"
           placeholder="Example : Research [topic], then write a summary, then draft a social media post about it."
           rows="6"
+          @input="onPromptEdited"
         />
         <button class="button" type="submit" :disabled="loading">
           {{ loading ? 'Processing...' : 'Submit' }}
@@ -345,9 +462,20 @@ async function logout() {
       <section v-if="stepItems.length > 0" class="response">
         <div class="section-head">
           <h2>Execution Steps</h2>
-          <button class="button small" type="button" :disabled="runningAll || loading" @click="runAllSteps">
-            {{ runningAll ? 'Running All...' : 'Run All' }}
-          </button>
+          <div class="section-actions">
+            <button
+              v-if="persistedWorkflowId"
+              class="button small ghost"
+              type="button"
+              :disabled="savingChanges || loading || !hasUnsavedChanges"
+              @click="saveWorkflowChanges"
+            >
+              {{ savingChanges ? 'Saving...' : 'Save Changes' }}
+            </button>
+            <button class="button small" type="button" :disabled="runningAll || loading" @click="runAllSteps">
+              {{ runningAll ? 'Running All...' : 'Run All' }}
+            </button>
+          </div>
         </div>
 
         <article v-for="item in stepItems" :key="item.index" class="log-card">
@@ -418,27 +546,6 @@ async function logout() {
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   padding: 1.25rem;
-}
-
-.navbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 0.75rem;
-  margin-bottom: 0.6rem;
-  flex-wrap: wrap;
-}
-
-.nav-menu {
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-}
-
-.nav-user {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
 }
 
 h1 {
@@ -513,6 +620,12 @@ p {
   justify-content: space-between;
   align-items: center;
   gap: 0.75rem;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 .usage {
