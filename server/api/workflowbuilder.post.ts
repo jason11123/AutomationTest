@@ -66,13 +66,52 @@
     })
   }
 
+  const workflow = parseWorkflow(text)
+
   return {
-    id: response.id,
-    model: response.model,
+    topic: workflow.topic,
+    step: workflow.step,
     output: text,
-    usage: response.usage
+    meta: {
+      id: response.id,
+      model: response.model,
+      usage: response.usage
+    }
   }
 })
+
+function parseWorkflow(rawText: string): { topic: string; step: string[] } {
+  const cleaned = rawText.trim()
+  const candidate = extractFirstJsonObject(cleaned) || cleaned
+
+  try {
+    const parsed = JSON.parse(candidate)
+    const topic = String(parsed?.topic || '').trim()
+    const step = Array.isArray(parsed?.step)
+      ? parsed.step.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+      : []
+
+    if (topic && step.length > 0) {
+      return { topic, step }
+    }
+  } catch {}
+
+  throw createError({
+    statusCode: 502,
+    statusMessage: 'Format output workflow tidak valid. Harus JSON dengan topic dan step[].'
+  })
+}
+
+function extractFirstJsonObject(text: string): string {
+  const start = text.indexOf('{')
+  const end = text.lastIndexOf('}')
+
+  if (start === -1 || end === -1 || end <= start) {
+    return ''
+  }
+
+  return text.slice(start, end + 1)
+}
 
 function extractOutputText(response: any): string {
   if (typeof response?.output_text === 'string' && response.output_text.trim().length > 0) {
