@@ -15,7 +15,7 @@ async function submitPrompt() {
   responseText.value = ''
 
   try {
-    const res = await $fetch<{ output: string }>('/api/llm', {
+    const res = await $fetch<{ output: string }>('/api/workflowbuilder', {
       method: 'POST',
       body: { prompt: prompt.value }
     })
@@ -34,8 +34,6 @@ async function submitPrompt() {
   <main class="container">
     <section class="card">
       <h1>Test OpenAI LLM</h1>
-      <p>Kirim prompt ke API Nuxt: <code>POST /api/llm</code></p>
-
       <form class="form" @submit.prevent="submitPrompt">
         <textarea
           v-model="prompt"
