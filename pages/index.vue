@@ -2,9 +2,19 @@
 type WorkflowResult = {
   topic: string
   step: string[]
+  meta?: {
+    usage?: TokenUsage
+  }
 }
 
 type StepStatus = 'pending_approval' | 'approved' | 'running' | 'success' | 'error'
+
+type TokenUsage = {
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cachedTokens: number
+}
 
 type StepItem = {
   index: number
@@ -13,6 +23,7 @@ type StepItem = {
   output: string
   error: string
   expanded: boolean
+  usage: TokenUsage | null
 }
 
 const prompt = ref('')
@@ -21,6 +32,8 @@ const stageMessage = ref('')
 const errorMessage = ref('')
 const workflow = ref<WorkflowResult | null>(null)
 const stepItems = ref<StepItem[]>([])
+const workflowUsage = ref<TokenUsage | null>(null)
+const runningAll = ref(false)
 
 async function submitPrompt() {
   if (!prompt.value.trim()) {
@@ -33,6 +46,7 @@ async function submitPrompt() {
   errorMessage.value = ''
   workflow.value = null
   stepItems.value = []
+  workflowUsage.value = null
 
   try {
     const workflowResponse = await $fetch<WorkflowResult>('/api/workflowbuilder', {
@@ -41,13 +55,15 @@ async function submitPrompt() {
     })
 
     workflow.value = workflowResponse
+    workflowUsage.value = workflowResponse.meta?.usage || null
     stepItems.value = workflowResponse.step.map((step, idx) => ({
       index: idx + 1,
       step,
       status: 'pending_approval',
       output: '',
       error: '',
-      expanded: false
+      expanded: false,
+      usage: null
     }))
 
     stageMessage.value = 'Workflow siap. Approve dan jalankan tiap step.'
@@ -126,20 +142,24 @@ async function runStep(stepIndex: number) {
       .filter((step) => step.index < stepIndex && step.status === 'success' && step.output.trim())
       .map((step) => `Step ${step.index}: ${step.output}`)
 
-    const res = await $fetch<{ index: number; step: string; output: string }>('/api/workflowexecute-step', {
-      method: 'POST',
-      body: {
-        topic: workflow.value.topic,
-        step: item.step,
-        index: item.index,
-        previousOutputs
+    const res = await $fetch<{ index: number; step: string; output: string; usage?: TokenUsage }>(
+      '/api/workflowexecute-step',
+      {
+        method: 'POST',
+        body: {
+          topic: workflow.value.topic,
+          step: item.step,
+          index: item.index,
+          previousOutputs
+        }
       }
-    })
+    )
 
     item.status = 'success'
     item.output = res.output
     item.error = ''
     item.expanded = true
+    item.usage = res.usage || null
 
     stageMessage.value = `Step ${item.index} selesai. Lanjut approve step berikutnya.`
   } catch (error: any) {
@@ -147,6 +167,34 @@ async function runStep(stepIndex: number) {
     item.output = ''
     item.error = error?.data?.statusMessage || error?.message || 'Eksekusi step gagal.'
     item.expanded = true
+    item.usage = null
+  }
+}
+
+async function runAllSteps() {
+  if (runningAll.value || loading.value) {
+    return
+  }
+
+  runningAll.value = true
+  stageMessage.value = 'Menjalankan semua step...'
+
+  try {
+    const ordered = [...stepItems.value].sort((a, b) => a.index - b.index)
+
+    for (const item of ordered) {
+      await runStep(item.index)
+      const latest = stepItems.value.find((step) => step.index === item.index)
+
+      if (!latest || latest.status !== 'success') {
+        stageMessage.value = `Run All berhenti di step ${item.index}. Perbaiki lalu lanjutkan.`
+        return
+      }
+    }
+
+    stageMessage.value = 'Semua step selesai dieksekusi.'
+  } finally {
+    runningAll.value = false
   }
 }
 
@@ -192,10 +240,22 @@ function statusLabel(status: StepStatus) {
       <section v-if="workflow" class="response">
         <h2>Workflow</h2>
         <p><strong>Topic:</strong> {{ workflow.topic }}</p>
+        <p v-if="workflowUsage" class="usage">
+          <strong>Builder Tokens:</strong>
+          input {{ workflowUsage.inputTokens }},
+          output {{ workflowUsage.outputTokens }},
+          total {{ workflowUsage.totalTokens }},
+          cached {{ workflowUsage.cachedTokens }}
+        </p>
       </section>
 
       <section v-if="stepItems.length > 0" class="response">
-        <h2>Execution Steps</h2>
+        <div class="section-head">
+          <h2>Execution Steps</h2>
+          <button class="button small" type="button" :disabled="runningAll || loading" @click="runAllSteps">
+            {{ runningAll ? 'Running All...' : 'Run All' }}
+          </button>
+        </div>
 
         <article v-for="item in stepItems" :key="item.index" class="log-card">
           <header class="log-header">
@@ -207,7 +267,7 @@ function statusLabel(status: StepStatus) {
               <button
                 class="button small"
                 type="button"
-                :disabled="item.status === 'running' || !canRun(item.index)"
+                :disabled="runningAll || item.status === 'running' || !canRun(item.index)"
                 @click="runStep(item.index)"
               >
                 {{ item.status === 'error' ? 'Retry' : item.status === 'success' ? 'Rerun' : 'Run' }}
@@ -236,6 +296,13 @@ function statusLabel(status: StepStatus) {
               :disabled="item.status === 'running'"
               placeholder="Output step akan muncul di sini. Kamu bisa edit manual."
             />
+            <p v-if="item.usage" class="usage">
+              <strong>Step Tokens:</strong>
+              input {{ item.usage.inputTokens }},
+              output {{ item.usage.outputTokens }},
+              total {{ item.usage.totalTokens }},
+              cached {{ item.usage.cachedTokens }}
+            </p>
           </div>
         </article>
       </section>
@@ -325,6 +392,19 @@ p {
   margin-top: 1rem;
   border-top: 1px solid #e5e7eb;
   padding-top: 1rem;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.usage {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: #374151;
 }
 
 .log-card {

@@ -27,12 +27,13 @@
   }
 
   const safeIndex = Number.isFinite(index) && index > 0 ? index : 1
-  const output = await executeStep(config, topic, step, safeIndex, previousOutputs)
+  const result = await executeStep(config, topic, step, safeIndex, previousOutputs)
 
   return {
     index: safeIndex,
     step,
-    output
+    output: result.output,
+    usage: result.usage
   }
 })
 
@@ -42,7 +43,7 @@ async function executeStep(
   stepText: string,
   stepIndex: number,
   previousOutputs: string[]
-): Promise<string> {
+): Promise<{ output: string; usage: ReturnType<typeof normalizeUsage> }> {
   const timezone = String(config.appTimezone || 'Asia/Jakarta')
   const timeContext = buildTimeContext(timezone)
   const hasPreviousOutputs = previousOutputs.length > 0
@@ -104,7 +105,10 @@ async function executeStep(
     })
   }
 
-  return output
+  return {
+    output,
+    usage: normalizeUsage(response?.usage)
+  }
 }
 
 async function callOpenAI(config: any, input: any[]) {
@@ -185,4 +189,18 @@ function addDays(date: Date, days: number): Date {
   const copy = new Date(date)
   copy.setDate(copy.getDate() + days)
   return copy
+}
+
+function normalizeUsage(usage: any) {
+  const inputTokens = Number(usage?.input_tokens || 0)
+  const outputTokens = Number(usage?.output_tokens || 0)
+  const totalTokens = Number(usage?.total_tokens || inputTokens + outputTokens)
+  const cachedTokens = Number(usage?.input_tokens_details?.cached_tokens || 0)
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    cachedTokens
+  }
 }

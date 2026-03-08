@@ -77,7 +77,7 @@
     meta: {
       id: response.id,
       model: response.model,
-      usage: response.usage
+      usage: normalizeUsage(response?.usage)
     }
   }
 })
@@ -304,4 +304,18 @@ function addDays(date: Date, days: number): Date {
   const copy = new Date(date)
   copy.setDate(copy.getDate() + days)
   return copy
+}
+
+function normalizeUsage(usage: any) {
+  const inputTokens = Number(usage?.input_tokens || 0)
+  const outputTokens = Number(usage?.output_tokens || 0)
+  const totalTokens = Number(usage?.total_tokens || inputTokens + outputTokens)
+  const cachedTokens = Number(usage?.input_tokens_details?.cached_tokens || 0)
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    cachedTokens
+  }
 }
