@@ -130,7 +130,7 @@ async function logout() {
       <section v-else class="list">
         <article v-for="item in items" :key="item.id" class="row">
           <div class="row-main">
-            <NuxtLink class="title" :to="`/workflows/${item.id}`">{{ item.title }}</NuxtLink>
+            <NuxtLink class="title" :to="`/workflows/${item.id}`" style=" text-decoration: underline;">{{ item.title }}</NuxtLink>
             <p class="meta">{{ item.topic }}</p>
             <p class="meta">
               Step {{ item.step_count }} | Exec {{ item.total_executions }} (OK {{ item.success_executions }} / ERR
